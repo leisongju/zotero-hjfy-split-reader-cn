@@ -14,3 +14,8 @@ tsconfig.tsbuildinfo
 .scaffold
 build
 logs
+
+# Local project management
+AGENTS.md
+backlog/
+.backlog/
