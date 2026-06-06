@@ -12,6 +12,9 @@ declare namespace _ZoteroTypes {
       "primaryScrollbarR": number;
       "primaryScrollbarG": number;
       "primaryScrollbarB": number;
+      "hjfyCookie": string;
+      "autoFetchOnNewItems": boolean;
+      "autoTranslateAttemptedKeys": string;
     };
   }
 }

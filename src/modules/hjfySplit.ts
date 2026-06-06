@@ -1,9 +1,54 @@
 import { getString } from "../utils/locale";
+import { getPref, setPref } from "../utils/prefs";
 import { SplitViewFactory } from "./splitView";
 
 interface ResolvedSelection {
   parentItem: Zotero.Item;
   sourcePDF: Zotero.Item;
+}
+
+interface ResolvedTranslationTarget {
+  parentItem: Zotero.Item;
+  sourcePDF?: Zotero.Item;
+}
+
+interface BatchJob {
+  index: number;
+  total: number;
+  title: string;
+  selection: ResolvedTranslationTarget;
+  lineIndex: number;
+}
+
+type BatchJobStatus =
+  | "downloaded"
+  | "source-downloaded"
+  | "existing"
+  | "skipped"
+  | "failed";
+
+interface BatchJobResult {
+  status: BatchJobStatus;
+  title: string;
+  message?: string;
+}
+
+interface BatchState {
+  total: number;
+  started: number;
+  running: number;
+  completed: number;
+  downloaded: number;
+  sourceDownloaded: number;
+  existing: number;
+  skipped: number;
+  failed: number;
+}
+
+interface SourcePDFFallbackResult {
+  status: "downloaded" | "existing" | "failed";
+  attachment: Zotero.Item | null;
+  message: string;
 }
 
 interface HJFYArxivInfo {
@@ -26,7 +71,7 @@ interface HJFYFileInfo {
 
 interface ResolvedArxivID {
   id: string;
-  source: "metadata" | "attachment" | "title-search";
+  source: "metadata" | "attachment" | "doi-search" | "title-search";
   title?: string;
 }
 
@@ -66,14 +111,45 @@ type ProgressReporter = (
   type?: "default" | "warning" | "error" | "success",
 ) => void;
 
+interface AutoTranslateAttemptRecord {
+  key: string;
+  attemptedAt: number;
+}
+
 class HJFYLoginRequiredError extends Error {
   constructor(public readonly arxivId: string) {
     super("幻觉翻译要求登录后才能为这篇论文创建翻译任务");
   }
 }
 
+class HJFYNoLatexSourceError extends Error {
+  constructor(public readonly sourcePDFResult: SourcePDFFallbackResult) {
+    super(
+      `这篇论文没有可用的 LaTeX 源码，hjfy.top 不能直接生成翻译 PDF；${sourcePDFResult.message}`,
+    );
+  }
+}
+
 export class HJFYSplitFactory {
   private static readonly menuID = "zotero-itemmenu-hjfy-split-reader";
+  private static readonly batchMenuID =
+    "zotero-itemmenu-hjfy-batch-translation";
+  private static readonly batchMaxConcurrency = 10;
+  private static readonly batchStartIntervalMS = 5000;
+  private static readonly batchTitleMaxLength = 72;
+  private static readonly autoTranslateSettleDelayMS = 30000;
+  private static readonly autoTranslateAttemptHistoryLimit = 10000;
+  private static readonly requestUserAgent =
+    "zotero-hjfy-split-reader-cn (Zotero Plugin; +https://github.com/leisongju/zotero-hjfy-split-reader-cn)";
+  private static readonly autoTranslatePendingParentIDs = new Set<number>();
+  private static readonly autoTranslateQueuedParentIDs = new Set<number>();
+  private static readonly autoTranslateQueue: number[] = [];
+  private static autoTranslateFlushTimer:
+    | ReturnType<typeof setTimeout>
+    | undefined;
+  private static autoTranslateNotifierID: string | undefined;
+  private static autoTranslateActiveCount = 0;
+  private static autoTranslateNextStartAt = 0;
   private static readonly titleSearchCache = new Map<
     string,
     ArxivTitleSearchCacheEntry
@@ -86,30 +162,101 @@ export class HJFYSplitFactory {
     const itemMenu = doc.getElementById("zotero-itemmenu");
     if (!itemMenu) return;
 
-    const elem = ztoolkit.UI.appendElement(
-      {
-        tag: "menuitem",
-        id: this.menuID,
-        namespace: "xul",
-        attributes: {
-          label: getString("hjfy-menu-label"),
-          image: `chrome://${addon.data.config.addonRef}/content/icons/svreader.svg`,
-        },
-        classList: ["menuitem-iconic"],
-        listeners: [
-          {
-            type: "command",
-            listener: () => {
-              void this.handleMenuCommand();
-            },
-          },
-        ],
-      },
-      itemMenu,
-    ) as XULElement;
+    const appendMenuItem = (
+      id: string,
+      label: string,
+      image: string,
+      listener: () => Promise<void>,
+    ) => {
+      if (doc.getElementById(id)) return;
 
-    (elem as any).style.setProperty("-moz-context-properties", "fill");
-    (elem as any).style.setProperty("fill", "currentColor");
+      const elem = ztoolkit.UI.appendElement(
+        {
+          tag: "menuitem",
+          id,
+          namespace: "xul",
+          attributes: {
+            label,
+            image,
+          },
+          classList: ["menuitem-iconic"],
+          listeners: [
+            {
+              type: "command",
+              listener: () => {
+                void listener();
+              },
+            },
+          ],
+        },
+        itemMenu,
+      ) as XULElement;
+
+      (elem as any).style.setProperty("-moz-context-properties", "fill");
+      (elem as any).style.setProperty("fill", "currentColor");
+    };
+
+    appendMenuItem(
+      this.menuID,
+      getString("hjfy-menu-label"),
+      `chrome://${addon.data.config.addonRef}/content/icons/svreader.svg`,
+      () => this.handleMenuCommand(),
+    );
+    appendMenuItem(
+      this.batchMenuID,
+      getString("hjfy-batch-menu-label"),
+      `chrome://${addon.data.config.addonRef}/content/icons/sync_24dp.svg`,
+      () => this.handleBatchMenuCommand(),
+    );
+  }
+
+  static registerAutoTranslateNotifier() {
+    if (!this.isAutoTranslateEnabled()) return;
+    if (this.autoTranslateNotifierID) return;
+
+    const callback = {
+      notify: async (
+        event: _ZoteroTypes.Notifier.Event,
+        type: _ZoteroTypes.Notifier.Type,
+        ids: number[] | string[],
+      ) => {
+        if (!addon?.data.alive) {
+          this.unregisterAutoTranslateNotifier();
+          return;
+        }
+        if (event !== "add") return;
+        if (type !== "item") return;
+
+        await this.handleAutoTranslateItemEvents(ids);
+      },
+    };
+
+    this.autoTranslateNotifierID = Zotero.Notifier.registerObserver(
+      callback,
+      ["item"],
+      `${addon.data.config.addonID}-auto-translate`,
+    );
+  }
+
+  static unregisterAll() {
+    this.unregisterAutoTranslateNotifier();
+    this.clearAutoTranslateQueue();
+  }
+
+  static handleAutoTranslatePreferenceChange(enabled: boolean) {
+    if (enabled) {
+      this.registerAutoTranslateNotifier();
+      return;
+    }
+
+    this.unregisterAutoTranslateNotifier();
+    this.clearAutoTranslateQueue();
+  }
+
+  private static unregisterAutoTranslateNotifier() {
+    if (!this.autoTranslateNotifierID) return;
+    Zotero.Notifier.unregisterObserver(this.autoTranslateNotifierID);
+    this.autoTranslateNotifierID = undefined;
   }
 
   private static async handleMenuCommand() {
@@ -131,7 +278,15 @@ export class HJFYSplitFactory {
     popup.show();
 
     try {
-      const { parentItem, sourcePDF } = this.resolveSelection(items[0]);
+      const report: ProgressReporter = (
+        text,
+        progress = 35,
+        type = "default",
+      ) => {
+        popup.createLine({ text, type, progress });
+      };
+      const { parentItem, sourcePDF } =
+        await this.resolveSelectionWithSourceFallback(items[0], report);
       let translatedPDF = this.findExistingTranslation(parentItem, sourcePDF);
 
       if (translatedPDF) {
@@ -141,13 +296,6 @@ export class HJFYSplitFactory {
           progress: 40,
         });
       } else {
-        const report: ProgressReporter = (
-          text,
-          progress = 35,
-          type = "default",
-        ) => {
-          popup.createLine({ text, type, progress });
-        };
         report("未找到现成翻译，正在向 hjfy.top 查询", 35);
         translatedPDF = await this.fetchAndAttachTranslation(
           parentItem,
@@ -192,6 +340,600 @@ export class HJFYSplitFactory {
     }
   }
 
+  private static async handleBatchMenuCommand() {
+    const items = ztoolkit.getGlobal("ZoteroPane").getSelectedItems();
+    if (!items.length) {
+      this.showMessage("请选择需要获取中文翻译 PDF 的论文条目", "warning");
+      return;
+    }
+
+    const popup = new ztoolkit.ProgressWindow(getString("hjfy-window-title"), {
+      closeOnClick: true,
+      closeTime: -1,
+    });
+    const { jobs, precheckedResults } = this.prepareBatchJobs(items);
+    const state: BatchState = {
+      total: jobs.length + precheckedResults.length,
+      started: 0,
+      running: 0,
+      completed: 0,
+      downloaded: 0,
+      sourceDownloaded: 0,
+      existing: 0,
+      skipped: 0,
+      failed: 0,
+    };
+
+    for (const result of precheckedResults) {
+      this.applyBatchResult(state, result);
+      state.completed += 1;
+    }
+
+    popup.createLine({
+      text: this.formatBatchSummary(state),
+      type: "default",
+      progress: this.getBatchSummaryProgress(state),
+    });
+
+    for (const result of precheckedResults) {
+      popup.createLine({
+        text: this.formatBatchResultLine(result),
+        type: this.getBatchResultLineType(result.status),
+        progress: 100,
+      });
+    }
+
+    jobs.forEach((job, index) => {
+      job.lineIndex = precheckedResults.length + index + 1;
+      popup.createLine({
+        text: `[${job.index}/${job.total}] 等待: ${this.truncateTitle(
+          job.title,
+        )}`,
+        type: "default",
+        progress: 0,
+      });
+    });
+    popup.show();
+
+    if (!jobs.length) {
+      this.updateBatchSummaryLine(popup, state);
+      popup.startCloseTimer(state.failed ? 8000 : 5000);
+      return;
+    }
+
+    await this.runBatchJobs(jobs, async (job) => {
+      state.started += 1;
+      state.running += 1;
+      this.updateBatchSummaryLine(popup, state);
+      const result = await this.processBatchJob(job, popup);
+      this.applyBatchResult(state, result);
+      state.running = Math.max(0, state.running - 1);
+      state.completed += 1;
+      this.updateBatchSummaryLine(popup, state);
+      return result;
+    });
+
+    popup.createLine({
+      text:
+        state.failed > 0
+          ? "批量获取已结束，部分论文未能保存译文 PDF"
+          : "批量获取已完成",
+      type: state.failed > 0 ? "warning" : "success",
+      progress: 100,
+    });
+    popup.startCloseTimer(state.failed ? 10000 : 6000);
+  }
+
+  private static prepareBatchJobs(items: Zotero.Item[]) {
+    const jobs: BatchJob[] = [];
+    const precheckedResults: BatchJobResult[] = [];
+    const seenParentIDs = new Set<number>();
+
+    for (const item of items) {
+      const fallbackTitle = this.getItemDisplayTitle(item);
+      try {
+        const selection = this.resolveTranslationTarget(item);
+        const parentID = selection.parentItem.id;
+        const title = this.getItemDisplayTitle(selection.parentItem);
+
+        if (seenParentIDs.has(parentID)) {
+          precheckedResults.push({
+            status: "skipped",
+            title,
+            message: "同一论文已经在本次批量任务中",
+          });
+          continue;
+        }
+
+        seenParentIDs.add(parentID);
+        const existing = this.findExistingTranslation(
+          selection.parentItem,
+          selection.sourcePDF,
+        );
+        if (existing) {
+          precheckedResults.push({
+            status: "existing",
+            title,
+            message: "已存在本地译文附件",
+          });
+          continue;
+        }
+
+        jobs.push({
+          index: jobs.length + 1,
+          total: 0,
+          title,
+          selection,
+          lineIndex: -1,
+        });
+      } catch (error) {
+        precheckedResults.push({
+          status: "failed",
+          title: fallbackTitle,
+          message: this.getErrorMessage(error),
+        });
+      }
+    }
+
+    for (const job of jobs) {
+      job.total = jobs.length;
+    }
+
+    return { jobs, precheckedResults };
+  }
+
+  private static async runBatchJobs(
+    jobs: BatchJob[],
+    worker: (job: BatchJob) => Promise<BatchJobResult>,
+  ) {
+    const results = new Array<BatchJobResult>(jobs.length);
+    let nextIndex = 0;
+    let nextStartAt = Date.now();
+
+    const claimNextJob = async () => {
+      if (nextIndex >= jobs.length) {
+        return null;
+      }
+
+      const index = nextIndex++;
+      const now = Date.now();
+      const startAt = Math.max(now, nextStartAt);
+      nextStartAt = startAt + this.batchStartIntervalMS;
+      const waitMS = startAt - now;
+      if (waitMS > 0) {
+        await Zotero.Promise.delay(waitMS);
+      }
+
+      return { index, job: jobs[index] };
+    };
+
+    await Promise.all(
+      Array.from(
+        { length: Math.min(this.batchMaxConcurrency, jobs.length) },
+        async () => {
+          while (true) {
+            const claimed = await claimNextJob();
+            if (!claimed) return;
+            results[claimed.index] = await worker(claimed.job);
+          }
+        },
+      ),
+    );
+
+    return results;
+  }
+
+  private static async processBatchJob(
+    job: BatchJob,
+    popup: InstanceType<ZToolkit["ProgressWindow"]>,
+  ): Promise<BatchJobResult> {
+    this.changeBatchJobLine(popup, job, "正在检查本地译文附件", 8);
+
+    try {
+      const { parentItem } = job.selection;
+      const sourcePDF =
+        job.selection.sourcePDF ||
+        (await this.ensureArxivSourcePDFByResolvingID(
+          parentItem,
+          (text, progress = 35, type = "default") => {
+            this.changeBatchJobLine(popup, job, text, progress, type);
+          },
+        )) ||
+        undefined;
+      const existing = this.findExistingTranslation(parentItem, sourcePDF);
+      if (existing) {
+        this.changeBatchJobLine(
+          popup,
+          job,
+          "已存在本地幻觉翻译附件，跳过下载",
+          100,
+          "success",
+        );
+        return {
+          status: "existing",
+          title: job.title,
+          message: "已存在本地译文附件",
+        };
+      }
+
+      const report: ProgressReporter = (
+        text,
+        progress = 35,
+        type = "default",
+      ) => {
+        this.changeBatchJobLine(popup, job, text, progress, type);
+      };
+
+      await this.fetchAndAttachTranslation(parentItem, report);
+      this.changeBatchJobLine(
+        popup,
+        job,
+        "已下载并保存中文译文 PDF",
+        100,
+        "success",
+      );
+      return {
+        status: "downloaded",
+        title: job.title,
+        message: "已保存中文译文 PDF",
+      };
+    } catch (error) {
+      if (
+        error instanceof HJFYNoLatexSourceError &&
+        error.sourcePDFResult.status !== "failed"
+      ) {
+        this.changeBatchJobLine(popup, job, error.message, 100, "warning");
+        return {
+          status: "source-downloaded",
+          title: job.title,
+          message: error.sourcePDFResult.message,
+        };
+      }
+
+      const message =
+        error instanceof HJFYLoginRequiredError
+          ? `${error.message}，请先在 hjfy.top 登录或手动创建任务`
+          : this.getErrorMessage(error);
+      this.changeBatchJobLine(popup, job, `失败: ${message}`, 100, "error");
+      ztoolkit.log("HJFY batch translation failed", job.title, error);
+      return {
+        status: "failed",
+        title: job.title,
+        message,
+      };
+    }
+  }
+
+  private static applyBatchResult(state: BatchState, result: BatchJobResult) {
+    switch (result.status) {
+      case "downloaded":
+        state.downloaded += 1;
+        break;
+      case "source-downloaded":
+        state.sourceDownloaded += 1;
+        break;
+      case "existing":
+        state.existing += 1;
+        break;
+      case "skipped":
+        state.skipped += 1;
+        break;
+      case "failed":
+        state.failed += 1;
+        break;
+    }
+  }
+
+  private static updateBatchSummaryLine(
+    popup: InstanceType<ZToolkit["ProgressWindow"]>,
+    state: BatchState,
+  ) {
+    popup.changeLine({
+      idx: 0,
+      text: this.formatBatchSummary(state),
+      type: state.failed ? "warning" : "default",
+      progress: this.getBatchSummaryProgress(state),
+    });
+  }
+
+  private static formatBatchSummary(state: BatchState) {
+    return (
+      `批量获取: 完成 ${state.completed}/${state.total}` +
+      `，运行 ${state.running}` +
+      `，新下载 ${state.downloaded}` +
+      `，原文 ${state.sourceDownloaded}` +
+      `，已存在 ${state.existing}` +
+      `，跳过 ${state.skipped}` +
+      `，失败 ${state.failed}` +
+      `；最多 ${this.batchMaxConcurrency} 并行，启动间隔 ${Math.round(
+        this.batchStartIntervalMS / 1000,
+      )} 秒`
+    );
+  }
+
+  private static getBatchSummaryProgress(state: BatchState) {
+    if (!state.total) return 100;
+    return Math.round((state.completed / state.total) * 100);
+  }
+
+  private static changeBatchJobLine(
+    popup: InstanceType<ZToolkit["ProgressWindow"]>,
+    job: BatchJob,
+    text: string,
+    progress: number,
+    type: "default" | "warning" | "error" | "success" = "default",
+  ) {
+    popup.changeLine({
+      idx: job.lineIndex,
+      text: `[${job.index}/${job.total}] ${this.truncateTitle(
+        job.title,
+      )}: ${text}`,
+      type,
+      progress,
+    });
+  }
+
+  private static formatBatchResultLine(result: BatchJobResult) {
+    const prefix =
+      result.status === "skipped"
+        ? "跳过"
+        : result.status === "failed"
+          ? "失败"
+          : result.status === "source-downloaded"
+            ? "已存原文"
+            : result.status === "existing"
+              ? "已存在"
+              : "已下载";
+    const message = result.message ? ` - ${result.message}` : "";
+    return `${prefix}: ${this.truncateTitle(result.title)}${message}`;
+  }
+
+  private static getBatchResultLineType(status: BatchJobStatus) {
+    if (status === "downloaded" || status === "existing") {
+      return "success";
+    }
+    if (status === "source-downloaded") {
+      return "warning";
+    }
+    if (status === "skipped") {
+      return "warning";
+    }
+    return "error";
+  }
+
+  private static truncateTitle(title: string) {
+    const trimmed = title.replace(/\s+/g, " ").trim();
+    if (trimmed.length <= this.batchTitleMaxLength) return trimmed;
+    return `${trimmed.slice(0, this.batchTitleMaxLength - 3)}...`;
+  }
+
+  private static getItemDisplayTitle(item: Zotero.Item) {
+    return (
+      String(item.getDisplayTitle?.() || item.getField("title") || "").trim() ||
+      "未命名条目"
+    );
+  }
+
+  private static getErrorMessage(error: unknown) {
+    return error instanceof Error ? error.message : "未知错误";
+  }
+
+  private static async handleAutoTranslateItemEvents(
+    ids: Array<number | string>,
+  ) {
+    if (!this.isAutoTranslateEnabled()) return;
+
+    for (const id of ids) {
+      const itemID = typeof id === "number" ? id : Number(id);
+      if (!Number.isFinite(itemID)) continue;
+
+      const item = Zotero.Items.get(itemID);
+      if (!item) continue;
+
+      if (this.isAutoTranslateCandidateItem(item)) {
+        this.queueAutoTranslateParent(item.id);
+        continue;
+      }
+
+      if (
+        item.isFileAttachment() &&
+        item.attachmentContentType === "application/pdf" &&
+        item.parentItemID &&
+        !this.isTranslationAttachment(item)
+      ) {
+        this.queueAutoTranslateParent(item.parentItemID);
+      }
+    }
+  }
+
+  private static isAutoTranslateEnabled() {
+    return Boolean(getPref("autoFetchOnNewItems"));
+  }
+
+  private static isAutoTranslateCandidateItem(item: Zotero.Item) {
+    return item.isRegularItem() && !(item as any).isFeedItem;
+  }
+
+  private static queueAutoTranslateParent(parentItemID: number) {
+    if (!this.isAutoTranslateEnabled()) return;
+    if (this.autoTranslatePendingParentIDs.has(parentItemID)) return;
+    if (this.autoTranslateQueuedParentIDs.has(parentItemID)) return;
+
+    this.autoTranslatePendingParentIDs.add(parentItemID);
+    this.scheduleAutoTranslateFlush();
+  }
+
+  private static scheduleAutoTranslateFlush() {
+    if (this.autoTranslateFlushTimer) {
+      clearTimeout(this.autoTranslateFlushTimer);
+    }
+
+    this.autoTranslateFlushTimer = setTimeout(() => {
+      this.autoTranslateFlushTimer = undefined;
+      this.flushAutoTranslatePendingItems();
+    }, this.autoTranslateSettleDelayMS);
+  }
+
+  private static flushAutoTranslatePendingItems() {
+    if (!this.isAutoTranslateEnabled()) {
+      this.clearAutoTranslateQueue();
+      return;
+    }
+
+    const parentItemIDs = Array.from(this.autoTranslatePendingParentIDs);
+    this.autoTranslatePendingParentIDs.clear();
+
+    for (const parentItemID of parentItemIDs) {
+      if (this.autoTranslateQueuedParentIDs.has(parentItemID)) continue;
+      this.autoTranslateQueuedParentIDs.add(parentItemID);
+      this.autoTranslateQueue.push(parentItemID);
+    }
+
+    this.pumpAutoTranslateQueue();
+  }
+
+  private static pumpAutoTranslateQueue() {
+    if (!this.isAutoTranslateEnabled()) {
+      this.clearAutoTranslateQueue();
+      return;
+    }
+
+    while (
+      this.autoTranslateActiveCount < this.batchMaxConcurrency &&
+      this.autoTranslateQueue.length
+    ) {
+      const parentItemID = this.autoTranslateQueue.shift();
+      if (!parentItemID) continue;
+
+      const now = Date.now();
+      const startAt = Math.max(now, this.autoTranslateNextStartAt);
+      this.autoTranslateNextStartAt = startAt + this.batchStartIntervalMS;
+      this.autoTranslateActiveCount += 1;
+
+      void this.runAutoTranslateJob(parentItemID, Math.max(0, startAt - now));
+    }
+  }
+
+  private static async runAutoTranslateJob(
+    parentItemID: number,
+    delayMS: number,
+  ) {
+    try {
+      if (delayMS > 0) {
+        await Zotero.Promise.delay(delayMS);
+      }
+      await this.processAutoTranslateParent(parentItemID);
+    } finally {
+      this.autoTranslateQueuedParentIDs.delete(parentItemID);
+      this.autoTranslateActiveCount = Math.max(
+        0,
+        this.autoTranslateActiveCount - 1,
+      );
+      this.pumpAutoTranslateQueue();
+    }
+  }
+
+  private static async processAutoTranslateParent(parentItemID: number) {
+    if (!this.isAutoTranslateEnabled()) return;
+
+    const parentItem = Zotero.Items.get(parentItemID);
+    if (!parentItem || !this.isAutoTranslateCandidateItem(parentItem)) return;
+    if (this.hasAutoTranslateAttempted(parentItem)) return;
+
+    const sourcePDF = this.findSourcePDF(parentItem);
+    if (!sourcePDF) {
+      ztoolkit.log(
+        "Auto HJFY translation waits for Zotero source PDF attachment",
+        parentItemID,
+      );
+      return;
+    }
+
+    const title = this.getItemDisplayTitle(parentItem);
+    const existing = this.findExistingTranslation(parentItem, sourcePDF);
+    if (existing) {
+      this.markAutoTranslateAttempted(parentItem);
+      ztoolkit.log("Auto HJFY translation skipped; translation exists", title);
+      return;
+    }
+
+    const report: ProgressReporter = (
+      text,
+      progress = 35,
+      type = "default",
+    ) => {
+      ztoolkit.log("Auto HJFY translation", {
+        title,
+        text,
+        progress,
+        type,
+      });
+    };
+
+    this.markAutoTranslateAttempted(parentItem);
+    try {
+      await this.fetchAndAttachTranslation(parentItem, report);
+      ztoolkit.log("Auto HJFY translation saved", title);
+    } catch (error) {
+      ztoolkit.log("Auto HJFY translation failed", title, error);
+    }
+  }
+
+  private static hasAutoTranslateAttempted(item: Zotero.Item) {
+    const itemKey = this.getAutoTranslateAttemptKey(item);
+    return this.getAutoTranslateAttemptRecords().some(
+      (record) => record.key === itemKey,
+    );
+  }
+
+  private static markAutoTranslateAttempted(item: Zotero.Item) {
+    const itemKey = this.getAutoTranslateAttemptKey(item);
+    const records = this.getAutoTranslateAttemptRecords().filter(
+      (record) => record.key !== itemKey,
+    );
+    records.push({
+      key: itemKey,
+      attemptedAt: Date.now(),
+    });
+
+    const trimmedRecords = records.slice(
+      -this.autoTranslateAttemptHistoryLimit,
+    );
+    setPref("autoTranslateAttemptedKeys", JSON.stringify(trimmedRecords));
+  }
+
+  private static getAutoTranslateAttemptKey(item: Zotero.Item) {
+    return `${item.libraryID}:${item.key}`;
+  }
+
+  private static getAutoTranslateAttemptRecords(): AutoTranslateAttemptRecord[] {
+    try {
+      const records = JSON.parse(
+        String(getPref("autoTranslateAttemptedKeys") || "[]"),
+      ) as AutoTranslateAttemptRecord[];
+      return Array.isArray(records)
+        ? records.filter(
+            (record) =>
+              typeof record?.key === "string" &&
+              typeof record?.attemptedAt === "number",
+          )
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private static clearAutoTranslateQueue() {
+    if (this.autoTranslateFlushTimer) {
+      clearTimeout(this.autoTranslateFlushTimer);
+      this.autoTranslateFlushTimer = undefined;
+    }
+    this.autoTranslatePendingParentIDs.clear();
+    this.autoTranslateQueuedParentIDs.clear();
+    this.autoTranslateQueue.length = 0;
+    this.autoTranslateActiveCount = 0;
+  }
+
   private static resolveSelection(item: Zotero.Item): ResolvedSelection {
     if (item.isRegularItem()) {
       const sourcePDF = this.findSourcePDF(item);
@@ -225,6 +967,67 @@ export class HJFYSplitFactory {
     }
 
     throw new Error("请选择论文主条目，或选择其下的 PDF 附件");
+  }
+
+  private static resolveTranslationTarget(
+    item: Zotero.Item,
+  ): ResolvedTranslationTarget {
+    if (item.isRegularItem()) {
+      return {
+        parentItem: item,
+        sourcePDF: this.findSourcePDF(item) || undefined,
+      };
+    }
+
+    if (
+      item.isFileAttachment() &&
+      item.attachmentContentType === "application/pdf"
+    ) {
+      if (!item.parentItemID) {
+        throw new Error("暂不支持独立 PDF 条目，请先选中文章主条目");
+      }
+      const parentItem = Zotero.Items.get(item.parentItemID);
+      if (!parentItem) {
+        throw new Error("无法找到这篇论文的父条目");
+      }
+
+      if (this.isTranslationAttachment(item)) {
+        return {
+          parentItem,
+          sourcePDF: this.findSourcePDF(parentItem, item) || undefined,
+        };
+      }
+
+      return { parentItem, sourcePDF: item };
+    }
+
+    throw new Error("请选择论文主条目，或选择其下的 PDF 附件");
+  }
+
+  private static async resolveSelectionWithSourceFallback(
+    item: Zotero.Item,
+    report: ProgressReporter,
+  ): Promise<ResolvedSelection> {
+    const target = this.resolveTranslationTarget(item);
+    if (target.sourcePDF) {
+      return {
+        parentItem: target.parentItem,
+        sourcePDF: target.sourcePDF,
+      };
+    }
+
+    const sourcePDF = await this.ensureArxivSourcePDFByResolvingID(
+      target.parentItem,
+      report,
+    );
+    if (!sourcePDF) {
+      throw new Error("该条目下没有可用于分屏的原始 PDF 附件");
+    }
+
+    return {
+      parentItem: target.parentItem,
+      sourcePDF,
+    };
   }
 
   private static findSourcePDF(
@@ -268,12 +1071,14 @@ export class HJFYSplitFactory {
 
   private static findExistingTranslation(
     parentItem: Zotero.Item,
-    sourcePDF: Zotero.Item,
+    sourcePDF?: Zotero.Item,
   ) {
     const arxivId = this.extractArxivId(parentItem);
-    const sourceKey = String(sourcePDF.getField("title") || "").trim();
+    const sourceKey = sourcePDF
+      ? String(sourcePDF.getField("title") || "").trim()
+      : "";
     const candidates = this.getPDFAttachments(parentItem).filter(
-      (attachment) => attachment.id !== sourcePDF.id,
+      (attachment) => attachment.id !== sourcePDF?.id,
     );
 
     return candidates.find((attachment) => {
@@ -319,9 +1124,12 @@ export class HJFYSplitFactory {
       report("arxivInfo 无响应，继续查询译文文件和任务状态", 42, "warning");
     }
     if (arxivInfo && !arxivInfo.hasSrc) {
-      throw new Error(
-        "这篇论文没有可用的 LaTeX 源码，hjfy.top 不能直接生成翻译 PDF",
+      const sourcePDFResult = await this.ensureArxivSourcePDF(
+        parentItem,
+        arxivId,
+        report,
       );
+      throw new HJFYNoLatexSourceError(sourcePDFResult);
     }
 
     report("正在查询是否已有 HJFY 译文文件", 45);
@@ -348,6 +1156,67 @@ export class HJFYSplitFactory {
     report("正在下载 HJFY 中文 PDF", 72);
     const pdfBuffer = await this.downloadBinary(fileInfo.zhCN);
     return this.savePdfAsAttachment(parentItem, pdfBuffer, arxivId);
+  }
+
+  private static async ensureArxivSourcePDFByResolvingID(
+    parentItem: Zotero.Item,
+    report: ProgressReporter,
+  ) {
+    const existing = this.findSourcePDF(parentItem);
+    if (existing) return existing;
+
+    const resolvedArxiv = await this.resolveArxivId(parentItem, report);
+    if (!resolvedArxiv) {
+      report("未能确认 arXiv ID，无法自动下载原文 PDF", 36, "warning");
+      return null;
+    }
+
+    await this.persistArxivMetadata(parentItem, resolvedArxiv, report);
+    const result = await this.ensureArxivSourcePDF(
+      parentItem,
+      resolvedArxiv.id,
+      report,
+    );
+    return result.attachment;
+  }
+
+  private static async ensureArxivSourcePDF(
+    parentItem: Zotero.Item,
+    arxivId: string,
+    report: ProgressReporter,
+  ): Promise<SourcePDFFallbackResult> {
+    const existing = this.findSourcePDF(parentItem);
+    if (existing) {
+      return {
+        status: "existing",
+        attachment: existing,
+        message: "本地已有原文 PDF 附件",
+      };
+    }
+
+    try {
+      report(`正在从 arXiv 下载原文 PDF: ${arxivId}`, 44, "warning");
+      const pdfBuffer = await this.downloadArxivPDF(arxivId);
+      const attachment = await this.saveArxivSourcePdfAsAttachment(
+        parentItem,
+        pdfBuffer,
+        arxivId,
+      );
+      report("已保存 arXiv 原文 PDF 附件", 48, "success");
+      return {
+        status: "downloaded",
+        attachment,
+        message: "已保存 arXiv 原文 PDF 附件",
+      };
+    } catch (error) {
+      const message = `未能下载 arXiv 原文 PDF: ${this.getErrorMessage(error)}`;
+      report(message, 48, "warning");
+      return {
+        status: "failed",
+        attachment: null,
+        message,
+      };
+    }
   }
 
   private static extractArxivId(item: Zotero.Item) {
@@ -420,6 +1289,24 @@ export class HJFYSplitFactory {
       return { id: attachmentId, source: "attachment" };
     }
 
+    const doi = this.normalizeDOI(String(parentItem.getField("DOI") || ""));
+    if (doi) {
+      report("正在根据 DOI 查询是否有关联 arXiv 版本", 38);
+      const doiMatch = await this.trySearchOpenAlexByDOI(
+        doi,
+        parentItem.getDisplayTitle().trim(),
+        report,
+      );
+      if (doiMatch) {
+        report(`已从 DOI 关联信息匹配 arXiv ID: ${doiMatch.id}`, 40, "success");
+        return {
+          id: doiMatch.id,
+          source: "doi-search",
+          title: doiMatch.title,
+        };
+      }
+    }
+
     const title = parentItem.getDisplayTitle().trim();
     if (!title) return null;
 
@@ -452,6 +1339,36 @@ export class HJFYSplitFactory {
       result,
     });
     return result;
+  }
+
+  private static async trySearchOpenAlexByDOI(
+    doi: string,
+    title: string,
+    report: ProgressReporter,
+  ) {
+    const params = new URLSearchParams({
+      filter: `doi:${doi}`,
+      "per-page": "1",
+    });
+    const url = `https://api.openalex.org/works?${params.toString()}`;
+    try {
+      const response = await this.withTimeout(
+        fetch(url, {
+          headers: this.getRequestHeaders(),
+        }),
+        30000,
+        "searchOpenAlexByDOI request",
+      );
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as { results?: OpenAlexWork[] };
+      return this.findOpenAlexArxivMatchByDOI(title, payload.results || []);
+    } catch (error) {
+      ztoolkit.log("OpenAlex DOI search failed", error);
+      report("DOI 关联查询暂不可用，继续按标题查询 arXiv", 39, "warning");
+      return null;
+    }
   }
 
   private static async trySearchArxivWebByTitle(
@@ -566,6 +1483,27 @@ export class HJFYSplitFactory {
     return null;
   }
 
+  private static findOpenAlexArxivMatchByDOI(
+    title: string,
+    works: OpenAlexWork[],
+  ): ArxivSearchResult | null {
+    for (const work of works) {
+      const id = this.extractArxivIdFromStrings(
+        this.getOpenAlexArxivCandidateStrings(work),
+      );
+      if (!id) continue;
+
+      const workTitle = work.display_name || work.title || title;
+      return {
+        id,
+        title: workTitle,
+        url: this.makeArxivAbsURL(id),
+      };
+    }
+
+    return null;
+  }
+
   private static getOpenAlexArxivCandidateStrings(work: OpenAlexWork) {
     const locations = [
       work.primary_location,
@@ -613,6 +1551,15 @@ export class HJFYSplitFactory {
       .replace(/[^a-z0-9]+/g, " ")
       .trim()
       .replace(/\s+/g, " ");
+  }
+
+  private static normalizeDOI(doi: string) {
+    const normalized = doi
+      .trim()
+      .replace(/^doi:\s*/i, "")
+      .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
+      .trim();
+    return this.extractArxivIdFromStrings([normalized]) ? "" : normalized;
   }
 
   private static levenshtein(a: string, b: string) {
@@ -671,9 +1618,11 @@ export class HJFYSplitFactory {
     const source =
       resolved.source === "title-search"
         ? "标题匹配"
-        : resolved.source === "attachment"
-          ? "附件信息"
-          : "已有元数据";
+        : resolved.source === "doi-search"
+          ? "DOI 关联"
+          : resolved.source === "attachment"
+            ? "附件信息"
+            : "已有元数据";
     report(`已写入 arXiv 标识（${source}）`, 43, "success");
   }
 
@@ -700,6 +1649,10 @@ export class HJFYSplitFactory {
 
   private static makeArxivAbsURL(arxivId: string) {
     return `https://arxiv.org/abs/${arxivId}`;
+  }
+
+  private static makeArxivPDFURL(arxivId: string) {
+    return `https://arxiv.org/pdf/${arxivId}.pdf`;
   }
 
   private static encodeArxivIdForPath(arxivId: string) {
@@ -733,29 +1686,102 @@ export class HJFYSplitFactory {
     }
   }
 
-  private static getRequestHeaders(): HeadersInit {
+  private static getRequestHeaders(): Record<string, string> {
     return {
-      "User-Agent":
-        "zotero-hjfy-split-reader-cn (Zotero Plugin; +https://github.com/leisongju/zotero-hjfy-split-reader-cn)",
+      "User-Agent": this.requestUserAgent,
     };
+  }
+
+  private static getHJFYRequestHeaders(): Record<string, string> {
+    const cookie = this.getHJFYCookie();
+    return cookie
+      ? {
+          ...this.getRequestHeaders(),
+          Cookie: cookie,
+        }
+      : this.getRequestHeaders();
+  }
+
+  private static getHJFYCookie() {
+    const raw = String(getPref("hjfyCookie") || "").trim();
+    if (!raw) return "";
+
+    const lines = raw
+      .replace(/\r/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const cookieLineIndex = lines.findIndex((line) =>
+      /^cookie(?:\s*:|\s*$)/i.test(line),
+    );
+    if (cookieLineIndex >= 0) {
+      const firstLineValue = lines[cookieLineIndex]
+        .replace(/^cookie\s*:?\s*/i, "")
+        .trim();
+      const continuationLines = [];
+      for (let i = cookieLineIndex + 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (/^[a-z][a-z0-9-]*\s*:/i.test(line)) break;
+        continuationLines.push(line);
+      }
+      return [firstLineValue, ...continuationLines]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s*;\s*/g, "; ")
+        .trim();
+    }
+
+    return lines
+      .join(" ")
+      .trim()
+      .replace(/^cookie\s+/i, "")
+      .replace(/\s*;\s*/g, "; ")
+      .trim();
+  }
+
+  private static isHJFYURL(url: string) {
+    try {
+      const parsed = new URL(url);
+      return (
+        parsed.hostname === "hjfy.top" || parsed.hostname.endsWith(".hjfy.top")
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private static async requestHJFY(
+    url: string,
+    label: string,
+    timeout: number,
+    responseType?: XMLHttpRequestResponseType,
+  ) {
+    return this.withTimeout(
+      Zotero.HTTP.request("GET", url, {
+        errorDelayMax: 0,
+        headers: this.getHJFYRequestHeaders(),
+        responseType,
+        successCodes: false,
+        timeout,
+      }),
+      timeout + 1000,
+      label,
+    );
   }
 
   private static async fetchArxivInfo(arxivId: string): Promise<HJFYArxivInfo> {
     const encodedArxivId = this.encodeArxivIdForPath(arxivId);
-    const response = await this.withTimeout(
-      fetch(`https://hjfy.top/api/arxivInfo/${encodedArxivId}`, {
-        headers: this.getRequestHeaders(),
-      }),
-      15000,
+    const xhr = await this.requestHJFY(
+      `https://hjfy.top/api/arxivInfo/${encodedArxivId}`,
       "fetchArxivInfo request",
+      15000,
     );
-    if (!response.ok) {
-      throw new Error(
-        `无法读取 hjfy.top 的 arXiv 信息: HTTP ${response.status}`,
-      );
+    if (xhr.status < 200 || xhr.status >= 300) {
+      throw new Error(`无法读取 hjfy.top 的 arXiv 信息: HTTP ${xhr.status}`);
     }
 
-    const payload = (await response.json()) as unknown as {
+    const payload = JSON.parse(xhr.responseText || "{}") as unknown as {
       status: number;
       data?: HJFYArxivInfo;
       msg?: string;
@@ -771,18 +1797,16 @@ export class HJFYSplitFactory {
     arxivId: string,
   ): Promise<HJFYArxivStatus | "login-required"> {
     const encodedArxivId = this.encodeArxivIdForPath(arxivId);
-    const response = await this.withTimeout(
-      fetch(`https://hjfy.top/api/arxivStatus/${encodedArxivId}`, {
-        headers: this.getRequestHeaders(),
-      }),
-      15000,
+    const xhr = await this.requestHJFY(
+      `https://hjfy.top/api/arxivStatus/${encodedArxivId}`,
       "fetchArxivStatus request",
+      15000,
     );
-    if (!response.ok) {
-      throw new Error(`无法查询翻译状态: HTTP ${response.status}`);
+    if (xhr.status < 200 || xhr.status >= 300) {
+      throw new Error(`无法查询翻译状态: HTTP ${xhr.status}`);
     }
 
-    const payload = (await response.json()) as unknown as {
+    const payload = JSON.parse(xhr.responseText || "{}") as unknown as {
       status: number;
       data?: HJFYArxivStatus;
       msg?: string;
@@ -801,18 +1825,16 @@ export class HJFYSplitFactory {
     arxivId: string,
   ): Promise<HJFYFileInfo> {
     const encodedArxivId = this.encodeArxivIdForPath(arxivId);
-    const response = await this.withTimeout(
-      fetch(`https://hjfy.top/api/arxivFiles/${encodedArxivId}`, {
-        headers: this.getRequestHeaders(),
-      }),
-      15000,
+    const xhr = await this.requestHJFY(
+      `https://hjfy.top/api/arxivFiles/${encodedArxivId}`,
       "fetchArxivFileInfo request",
+      15000,
     );
-    if (!response.ok) {
-      throw new Error(`无法读取翻译文件信息: HTTP ${response.status}`);
+    if (xhr.status < 200 || xhr.status >= 300) {
+      throw new Error(`无法读取翻译文件信息: HTTP ${xhr.status}`);
     }
 
-    const payload = (await response.json()) as unknown as {
+    const payload = JSON.parse(xhr.responseText || "{}") as unknown as {
       status: number;
       data?: HJFYFileInfo;
       msg?: string;
@@ -835,15 +1857,12 @@ export class HJFYSplitFactory {
   private static async primeArxivTask(arxivId: string) {
     const encodedArxivId = this.encodeArxivIdForPath(arxivId);
     try {
-      const response = await this.withTimeout(
-        fetch(`https://hjfy.top/arxiv/${encodedArxivId}`, {
-          headers: this.getRequestHeaders(),
-        }),
-        15000,
+      const xhr = await this.requestHJFY(
+        `https://hjfy.top/arxiv/${encodedArxivId}`,
         "primeArxivTask request",
+        15000,
       );
-      const text = await response.text();
-      if (text.includes("需要先登录")) {
+      if ((xhr.responseText || "").includes("需要先登录")) {
         throw new HJFYLoginRequiredError(arxivId);
       }
     } catch (error) {
@@ -887,6 +1906,20 @@ export class HJFYSplitFactory {
 
   private static async downloadBinary(url: string) {
     const downloadURL = new URL(url, "https://hjfy.top/").toString();
+    const isHJFYURL = this.isHJFYURL(downloadURL);
+    if (isHJFYURL) {
+      const xhr = await this.requestHJFY(
+        downloadURL,
+        "downloadBinary request",
+        120000,
+        "arraybuffer",
+      );
+      if (xhr.status < 200 || xhr.status >= 300) {
+        throw new Error(`下载翻译 PDF 失败: HTTP ${xhr.status}`);
+      }
+      return xhr.response as ArrayBuffer;
+    }
+
     const response = await this.withTimeout(
       fetch(downloadURL, {
         headers: this.getRequestHeaders(),
@@ -899,6 +1932,36 @@ export class HJFYSplitFactory {
     }
 
     return response.arrayBuffer();
+  }
+
+  private static async downloadArxivPDF(arxivId: string) {
+    const response = await this.withTimeout(
+      fetch(this.makeArxivPDFURL(arxivId), {
+        headers: this.getRequestHeaders(),
+      }),
+      120000,
+      "downloadArxivPDF request",
+    );
+    if (!response.ok) {
+      throw new Error(`下载 arXiv 原文 PDF 失败: HTTP ${response.status}`);
+    }
+
+    const buffer = await response.arrayBuffer();
+    if (!this.isPDFBuffer(buffer)) {
+      throw new Error("arXiv 返回的内容不是有效 PDF");
+    }
+    return buffer;
+  }
+
+  private static isPDFBuffer(buffer: ArrayBuffer) {
+    const bytes = new Uint8Array(buffer);
+    return (
+      bytes.length >= 4 &&
+      bytes[0] === 0x25 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x44 &&
+      bytes[3] === 0x46
+    );
   }
 
   private static async savePdfAsAttachment(
@@ -936,6 +1999,46 @@ export class HJFYSplitFactory {
         }
       } catch (error) {
         ztoolkit.log("Failed to clean temp translation file", error);
+      }
+    }
+  }
+
+  private static async saveArxivSourcePdfAsAttachment(
+    parentItem: Zotero.Item,
+    pdfBuffer: ArrayBuffer,
+    arxivId: string,
+  ) {
+    const title = this.makeAttachmentTitle(parentItem.getDisplayTitle());
+    const filename = `${title}_arxiv_${this.makeArxivFilenameID(arxivId)}.pdf`;
+    const tempDir = Zotero.getTempDirectory();
+    tempDir.append("hjfy-split-reader");
+    if (!tempDir.exists()) {
+      tempDir.create(1, 0o755);
+    }
+
+    const tempFile = tempDir.clone();
+    tempFile.append(filename);
+
+    try {
+      await this.writeFile(tempFile, pdfBuffer);
+      const attachment = await Zotero.Attachments.importFromFile({
+        file: tempFile,
+        parentItemID: parentItem.id,
+      });
+      attachment.setField(
+        "title",
+        `arXiv PDF - ${parentItem.getDisplayTitle()}`,
+      );
+      this.safeSetField(attachment, "url", this.makeArxivPDFURL(arxivId));
+      await attachment.saveTx();
+      return attachment;
+    } finally {
+      try {
+        if (tempFile.exists()) {
+          tempFile.remove(false);
+        }
+      } catch (error) {
+        ztoolkit.log("Failed to clean temp arXiv source PDF file", error);
       }
     }
   }

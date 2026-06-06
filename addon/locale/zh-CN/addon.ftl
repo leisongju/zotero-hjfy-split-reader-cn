@@ -33,4 +33,5 @@ splitview-command-label = 分屏阅读器
 splitview-select-first-pdf = 选择已打开的PDF或输入文字搜索
 splitview-select-second-pdf = 选择第二篇PDF或输入文字搜索，或按Esc退出
 hjfy-menu-label = 获取幻觉翻译并分屏打开
+hjfy-batch-menu-label = 批量获取幻觉翻译 PDF（不打开）
 hjfy-window-title = HJFY Split Reader

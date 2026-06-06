@@ -1,4 +1,5 @@
 import { config } from "../../package.json";
+import { HJFYSplitFactory } from "./hjfySplit";
 import { getPref, setPref } from "../utils/prefs";
 
 export async function registerPrefsScripts(_window: Window) {
@@ -21,6 +22,7 @@ function updatePrefsUI() {
 
   // Initialize color preview with current pref values
   updateColorPreview(doc);
+  updateHJFYCookieInput(doc);
 }
 
 function bindPrefEvents() {
@@ -44,6 +46,27 @@ function bindPrefEvents() {
     const target = e.target as HTMLInputElement;
     setPref("syncEnabled", target.checked);
   });
+
+  // Checkbox: automatically fetch HJFY translations for newly added papers
+  const autoFetchCheckbox = doc.querySelector(
+    `#zotero-prefpane-${config.addonRef}-auto-fetch-on-new-items`,
+  ) as HTMLInputElement | null;
+  autoFetchCheckbox?.addEventListener("command", (e: Event) => {
+    const target = e.target as HTMLInputElement;
+    setPref("autoFetchOnNewItems", target.checked);
+    HJFYSplitFactory.handleAutoTranslatePreferenceChange(target.checked);
+  });
+
+  // Password input: HJFY cookie for authenticated translation tasks
+  const hjfyCookieInput = doc.querySelector(
+    `#zotero-prefpane-${config.addonRef}-hjfy-cookie`,
+  ) as HTMLInputElement | null;
+  const saveHJFYCookie = (e: Event) => {
+    const target = e.target as HTMLInputElement;
+    setPref("hjfyCookie", target.value.trim());
+  };
+  hjfyCookieInput?.addEventListener("input", saveHJFYCookie);
+  hjfyCookieInput?.addEventListener("change", saveHJFYCookie);
 
   // RGB inputs: Primary scrollbar color
   const rInput = doc.querySelector(
@@ -75,6 +98,15 @@ function bindPrefEvents() {
   handleColorChange(rInput, "primaryScrollbarR");
   handleColorChange(gInput, "primaryScrollbarG");
   handleColorChange(bInput, "primaryScrollbarB");
+}
+
+function updateHJFYCookieInput(doc: Document) {
+  const input = doc.querySelector(
+    `#zotero-prefpane-${config.addonRef}-hjfy-cookie`,
+  ) as HTMLInputElement | null;
+  if (input) {
+    input.value = String(getPref("hjfyCookie") || "");
+  }
 }
 
 function updateColorPreview(doc: Document) {

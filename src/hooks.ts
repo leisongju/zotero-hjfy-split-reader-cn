@@ -26,6 +26,7 @@ async function onStartup() {
   SplitViewFactory.registerPrefObservers();
   SplitViewFactory.registerPromptCommands();
   HJFYSplitFactory.registerItemMenu();
+  HJFYSplitFactory.registerAutoTranslateNotifier();
 
   BasicExampleFactory.registerPrefs();
 
@@ -62,6 +63,7 @@ async function onMainWindowUnload(win: Window): Promise<void> {
   // This prevents keeping references to DOM nodes and windows that
   // become "dead objects" after Zotero is closed and reopened.
   SplitViewFactory.unregisterAll();
+  HJFYSplitFactory.unregisterAll();
 
   // Cleanup ztoolkit and any open dialog windows.
   ztoolkit.unregisterAll();
@@ -70,6 +72,7 @@ async function onMainWindowUnload(win: Window): Promise<void> {
 
 function onShutdown(): void {
   SplitViewFactory.unregisterAll();
+  HJFYSplitFactory.unregisterAll();
   ztoolkit.unregisterAll();
   addon.data.dialog?.window?.close();
   // Remove addon object

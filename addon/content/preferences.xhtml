@@ -33,6 +33,39 @@
 </groupbox>
 
 <groupbox>
+  <!-- HJFY Settings -->
+  <label>
+    <html:h2 data-l10n-id="pref-section-hjfy" style="margin: 20px 0 8px 0">
+    </html:h2>
+  </label>
+  <checkbox
+    id="zotero-prefpane-__addonRef__-auto-fetch-on-new-items"
+    preference="autoFetchOnNewItems"
+    data-l10n-id="pref-auto-fetch-on-new-items"
+    style="margin-top: 0"
+  />
+  <description
+    data-l10n-id="pref-auto-fetch-on-new-items-desc"
+    style="font-size: 0.9em; opacity: 0.7; margin: 2px 0 8px 24px"
+  />
+  <html:label
+    for="zotero-prefpane-__addonRef__-hjfy-cookie"
+    data-l10n-id="pref-hjfy-cookie"
+    style="display: block; margin-bottom: 4px"
+  ></html:label>
+  <html:input
+    type="password"
+    id="zotero-prefpane-__addonRef__-hjfy-cookie"
+    preference="hjfyCookie"
+    style="width: 100%; box-sizing: border-box"
+  />
+  <description
+    data-l10n-id="pref-hjfy-cookie-desc"
+    style="font-size: 0.9em; opacity: 0.7; margin: 6px 0 8px 0"
+  />
+</groupbox>
+
+<groupbox>
   <!-- Appearance Settings -->
   <label>
     <html:h2

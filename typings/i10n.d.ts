@@ -3,6 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 export type FluentMessageId =
+  | 'hjfy-batch-menu-label'
   | 'hjfy-menu-label'
   | 'hjfy-window-title'
   | 'item-info-row-example-label'
@@ -16,13 +17,18 @@ export type FluentMessageId =
   | 'menuitem-submenulabel'
   | 'menupopup-label'
   | 'pref-about-desc'
+  | 'pref-auto-fetch-on-new-items'
+  | 'pref-auto-fetch-on-new-items-desc'
   | 'pref-follow-focus'
   | 'pref-follow-focus-desc'
+  | 'pref-hjfy-cookie'
+  | 'pref-hjfy-cookie-desc'
   | 'pref-scrollbar-color'
   | 'pref-scrollbar-color-desc'
   | 'pref-section-about'
   | 'pref-section-appearance'
   | 'pref-section-basic'
+  | 'pref-section-hjfy'
   | 'pref-sync-enabled'
   | 'pref-sync-enabled-desc'
   | 'pref-title'

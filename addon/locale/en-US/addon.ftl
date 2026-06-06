@@ -33,4 +33,5 @@ splitview-command-label = Split View Reader
 splitview-select-first-pdf = Select open PDF or type to search
 splitview-select-second-pdf = Select second PDF or type to search, or Esc to exit
 hjfy-menu-label = Fetch HJFY translation and open in split view
+hjfy-batch-menu-label = Batch fetch HJFY translation PDFs
 hjfy-window-title = HJFY Split Reader
