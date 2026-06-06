@@ -4,41 +4,17 @@
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue?style=flat-square)](LICENSE)
 [![Using Zotero Plugin Template](https://img.shields.io/badge/Using-Zotero%20Plugin%20Template-blue?style=flat-square&logo=github)](https://github.com/windingwind/zotero-plugin-template)
 
-HJFY Split Reader CN 是一个 Zotero 8 / 9 插件，用来为 arXiv 论文获取 `hjfy.top` 上的中文翻译 PDF，并把原文 PDF 与译文 PDF 在 Zotero 阅读器里分屏打开。
-
-这个仓库是基于 [Infinity4B/zotero-hjfy-split-reader](https://github.com/Infinity4B/zotero-hjfy-split-reader) 的改版。改版重点不只是自动补找 arXiv ID，也包括修复实际使用中容易导致“查不到、拉不下、一直卡住”的 HJFY 查询和下载链路：`arxivInfo` 接口失败或无响应时不再卡死，HJFY 状态轮询有明确进度提示，返回相对 PDF URL 时也能正常下载，下载成功后会把中文译文 PDF 挂回原 Zotero 论文条目。
+HJFY Split Reader CN 是一个 Zotero 8 / 9 插件，用来获取 arXiv 论文在 `hjfy.top` 上的中文翻译 PDF，并在 Zotero 里进行原文/译文分屏阅读。
 
 ## 主要功能
 
-- 在 Zotero 条目和附件右键菜单中增加“获取幻觉翻译并分屏打开”。
-- 优先复用同一条目下已经存在的 HJFY 中文译文附件。
-- 查询 `hjfy.top`，如果已有译文 PDF，则自动下载并保存为当前条目的子附件。
-- 如果 Zotero 条目还没有本地 PDF，但能通过 DOI、URL、Extra 或标题确认 arXiv 版本，会先下载 arXiv 原文 PDF 并挂回条目。
-- 下载完成后，自动把原文 PDF 与中文译文 PDF 在同一标签页中分屏打开。
-- 支持多选论文后右键批量获取 HJFY 中文译文 PDF，仅保存附件，不自动打开阅读器。
-- 支持新增论文后自动尝试获取一次 HJFY 中文译文 PDF，默认关闭，可在插件设置中开启。
-- 默认以右侧译文窗格为主窗格，左侧原文跟随译文滚动。
-- 保留分屏阅读器的交换左右窗格、滚动同步等能力。
-
-## 本改版新增内容
-
-- 支持从 Zotero 条目的 DOI、URL、Extra 字段中识别 arXiv ID。
-- 支持从 PDF 附件标题、附件 URL、附件文件名中识别 arXiv ID。
-- 如果条目只有正式 DOI，插件会先查询 DOI 是否有关联的 arXiv 开放版本。
-- 当条目没有 arXiv 标识时，会按标题查询 arXiv，并使用严格标题匹配降低误判。
-- arXiv 标题查询参考 Zotero 官方 `arXiv.org.js` translator 的网页搜索方式，而不是直接用容易触发限制的 `export.arxiv.org` 标题查询。
-- 增加 OpenAlex works API 作为标题查询兜底，数据解析参考 Zotero 官方 OpenAlex translators。
-- 自动写回 `Extra: arXiv: <id>`；如果条目没有 URL，会写入 arXiv URL；如果条目没有 DOI，会写入 arXiv DOI。插件不会覆盖已有正式 DOI。
-- 手动和批量流程在条目缺少本地 PDF 时会尝试下载 arXiv 原文 PDF；即使 HJFY 提示没有 LaTeX 源码，也会先保存可下载的 arXiv 原文 PDF 附件。
-- 对 `hjfy.top/api/arxivInfo` 增加超时和失败兜底，避免接口异常或不返回时整个流程卡死。
-- 修复 HJFY 查询/下载链路中的多个失败点，减少“明明网页能下载，但插件拉不下来”的情况。
-- 轮询 HJFY 翻译状态时显示进度窗口，让用户能看出插件仍在等待结果，而不是无反馈卡住。
-- 支持 HJFY 返回相对路径 PDF URL 的情况，避免因为 URL 不是完整地址而下载失败。
-- 支持在插件设置中配置 HJFY Cookie，用于需要登录态的翻译任务创建和状态查询。
-- 下载成功后自动把中文译文 PDF 作为当前论文条目的附件保存，后续再次打开会优先复用本地译文附件。
-- 增加“批量获取幻觉翻译 PDF（不打开）”右键入口，批量任务最多 10 篇保持活跃，每个新任务至少间隔 5 秒启动，避免一次性并发请求过多。
-- 增加新增论文自动获取开关，默认关闭；开启后插件会等待新条目和 PDF 附件稳定后自动尝试一次，只保存译文附件，不打开阅读器。
-- 对没有 arXiv 版本、标题匹配失败、HJFY 没有可下载译文等情况给出更明确的失败反馈。
+- 单篇获取 HJFY 中文译文 PDF，并自动与原文分屏打开。
+- 多选论文后批量获取中文译文 PDF，只保存附件，不自动打开阅读器。
+- 自动识别 arXiv ID，支持 DOI、URL、Extra、PDF 附件信息和标题搜索。
+- 条目没有本地 PDF 时，手动和批量流程可先下载 arXiv 原文 PDF。
+- 支持在设置中填写 HJFY Cookie，用于需要登录态的翻译任务。
+- 可选监听新增论文并自动尝试获取译文，默认关闭；自动流程会等 Zotero 自己的 PDF 附件出现，避免重复下载原文 PDF。
+- 复用本地已有译文附件，避免重复下载。
 
 ## 界面预览
 
